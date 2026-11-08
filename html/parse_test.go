@@ -544,3 +544,101 @@ func TestDuplicateAttrSelfClosingForeignContent(t *testing.T) {
 		t.Errorf("got %q, want it to contain %q", got, want)
 	}
 }
+
+func TestNoahsArkClauseAttributeOrder(t *testing.T) {
+	// The Noah's Ark clause compares the attributes of formatting elements.
+	// That comparison must not depend on attribute order, and must stay cheap
+	// for elements with many attributes, which relies on the attributes of the
+	// elements in the list of active formatting elements being kept sorted
+	// (see CVE-2026-25680).
+	manyAttrs := func(reverse bool) string {
+		const n = 1000
+		var sb strings.Builder
+		for i := 0; i < n; i++ {
+			j := i
+			if reverse {
+				j = n - 1 - i
+			}
+			fmt.Fprintf(&sb, ` a%d="%d"`, j, j)
+		}
+		return sb.String()
+	}
+	fwd, rev := manyAttrs(false), manyAttrs(true)
+
+	for _, tc := range []struct {
+		name      string
+		input     string
+		want      int // number of <b> elements reconstructed inside the second <p>
+		wantAttrs int // attributes on each reconstructed <b>, or -1 to skip the check
+	}{
+		{
+			name:      "identical attributes in different orders",
+			input:     `<p><b a="1" c="2"><b c="2" a="1"><b a="1" c="2"><b c="2" a="1"><p>X`,
+			want:      3,
+			wantAttrs: 2,
+		},
+		{
+			name:      "different attribute values",
+			input:     `<p><b a="1" c="2"><b c="3" a="1"><b a="1" c="4"><b c="5" a="1"><p>X`,
+			want:      4,
+			wantAttrs: 2,
+		},
+		{
+			name:      "same values under different keys",
+			input:     `<p><b a="1" c="2"><b a="2" c="1"><b a="1" c="2"><b a="2" c="1"><p>X`,
+			want:      4,
+			wantAttrs: 2,
+		},
+		{
+			name:      "different attribute counts",
+			input:     `<p><b a="1"><b a="1" c="2"><b a="1"><b a="1" c="2"><p>X`,
+			want:      4,
+			wantAttrs: -1,
+		},
+		{
+			name:      "many identical attributes in different orders",
+			input:     "<p><b" + fwd + "><b" + rev + "><b" + fwd + "><b" + rev + "><b" + fwd + "><p>X",
+			want:      3,
+			wantAttrs: 1000,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc, err := Parse(strings.NewReader(tc.input))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			var ps []*Node
+			var walk func(*Node)
+			walk = func(n *Node) {
+				if n.Type == ElementNode && n.DataAtom == atom.P {
+					ps = append(ps, n)
+				}
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					walk(c)
+				}
+			}
+			walk(doc)
+			if len(ps) != 2 {
+				t.Fatalf("got %d <p> elements, want 2", len(ps))
+			}
+			got := 0
+			n := ps[1].FirstChild
+			for ; n != nil && n.Type == ElementNode && n.DataAtom == atom.B; n = n.FirstChild {
+				got++
+				if tc.wantAttrs >= 0 && len(n.Attr) != tc.wantAttrs {
+					t.Errorf("<b> #%d has %d attributes, want %d", got, len(n.Attr), tc.wantAttrs)
+				}
+				attr := n.Attr
+				if !sort.SliceIsSorted(attr, func(i, j int) bool { return attr[i].Key < attr[j].Key }) {
+					t.Errorf("<b> #%d attributes are not sorted", got)
+				}
+			}
+			if got != tc.want {
+				t.Errorf("got %d reconstructed <b> elements, want %d", got, tc.want)
+			}
+			if n == nil || n.Type != TextNode || n.Data != "X" {
+				t.Errorf("innermost <b> does not contain the text node %q", "X")
+			}
+		})
+	}
+}
